@@ -51,10 +51,12 @@ Cuerda solves these problems, at the expense of losing ropes’ ability
 to inexpensively refer to older versions of the data, and beating the
 hell out of your garbage collector’s write barrier, if you have one.
 Cuerda is a mutable string type that supports metadata that refers to
-particular points in the string, called “marks”, which move with the
+particular spans in the string, called “ranges”,
+analogous to XEmacs “extents”,
+which move with the
 insertions and deletions in the string.  Cuerda has good worst-case
 efficiency from cuerdas of about 32 bytes up to cuerdas of at least a
-tebibyte, and with up to about 32 bytes of text per mark.
+tebibyte, and with up to about 64 bytes of text per range.
 
 Example
 -------
@@ -64,13 +66,22 @@ Yeah, I’ll totally put an example here.
 API
 ---
 
-XXX this all needs to be revamped to use some kind of position object
-that doesn’t imply constantly going up to the root of the tree to
-count bytes.  Also missing: an explicit search interface (so search
-doesn’t involve multiple function calls per byte) and maybe some more
+There are four kinds of objects in the API: cuerdas, slices, ranges,
+and allocation disciplines.  A cuerda is a mutable string, and slices
+and ranges are subsets of cuerdas.  Slices can be ephemerally created
+and become invalid when the cuerda changes, while ranges must be
+explicitly destroyed, are updated when the cuerda changes, and are
+associated with some metadata.  Finally, an allocation discipline is a
+way that the cuerda will allocate or deallocate when necessary.
+
+XXX should a range just be a kind of slice?  Should the cuerda objects
+be exposed at all, or are ranges enough?
+
+XXX Also missing: an explicit search interface (so search doesn’t
+involve multiple function calls per byte) and maybe some more
 convenient interface.
 
-### Basic lifecycle ###
+### Basic cuerda creation and destruction ###
 
 `cuerda *cuerda_new()` allocates a new empty cuerda with `malloc` and
 returns it.  This is a convenience wrapper for the more elaborate
@@ -88,26 +99,93 @@ cuerda, and deallocates the cuerda itself using the same allocator.
 This is a convenience wrapper for `cuerda_destroy`.  It takes O(N)
 time in the data in the cuerda.
 
+### Slices ###
+
+Any access to the contents of a cuerda uses a slice to indicate which
+part of the contents are to be accessed.  Slices are small ephemeral
+objects, and they are generally copied to avoid memory-management
+headaches.  Creating and modifying slices does not write to a cuerda;
+writing to a cuerda invalidates all previously existing slices on it.
+
+`cuerda_slice cuerda_all(cuerda *)` returns a slice including the
+entire cuerda in constant time.
+
+`cuerda_slice cuerda_slice_advance(cuerda_slice, ptrdiff_t nbytes)`
+returns a copy of the given slice with its beginning moved forward by
+at most the given number of bytes, including backward if negative.  If
+this would advance it past the end of the slice, it is moved forward
+to the end of the slice instead; if this would move it backward before
+the beginning of the cuerda, it is moved to the beginning of the
+cuerda instead.  O(log(N)) in the size of the cuerda.
+
+`cuerda_slice cuerda_slice_extend(cuerda_slice, ptrdiff_t nbytes)` is
+analogous to `cuerda_slice_advance`, but moves the end rather than the
+beginning.  If this would move it backward before the beginning of the
+slice, it is moved to the beginning of the slice instead; if this
+would move it forward past the end of the cuerda, it is moved to the
+end of the cuerda instead.  O(log(N)) in the size of the cuerda.
+
+`size_t cuerda_length(cuerda_slice)` returns the number of bytes in
+the given slice, like `strlen`.  O(log(N)) in the size of the cuerda.
+
+XXX iterating over chunks of bytes in a slice?
+
+XXX overlaps, intersects, contains?
+
+### Ranges ###
+
+`cuerda_range *cuerda_new_range(cuerda_slice, int tag, void
+*user_data)` dynamically allocates a new range pointing to the given
+slice with the given metadata.  This is a convenience wrapper for
+`cuerda_make_range`.  It returns NULL on allocation failure.  Takes
+O(log(N)) time in the size of the cuerda.
+
+`void cuerda_free_range(cuerda_range *)` destroys and deallocates a
+range.  This is a convenience wrapper for `cuerda_destroy_range`.
+O(log(N)) time in the size of the cuerda.
+
+The more important performance consideration is that if you leave
+ranges sitting around, they take up a surprising amount of memory, and
+also slow down all kinds of mutation operations in their vicinity,
+although not nearly as much as you probably expect if you’re used to
+thinking about markers in Elisp.
+So you should probably free your ranges at the
+earliest opportunity.  If you love them, at least.
+
+`cuerda_slice cuerda_get_range(cuerda_range *)` returns the slice that
+the given range currently covers.  Constant time.  XXX what to do if
+the cuerda is already destroyed?
+
+`int cuerda_set_range(cuerda_range *, cuerda_slice)` makes the given
+range cover an arbitrary different slice.  O(log(N)) time in the size
+of the cuerda in the worst case.  It returns true unless there was an
+allocation failure, which can totally happen, so watch out.
+
+The `cuerda_range` structure itself has public fields `cuerda`, `tag`,
+and `user_data`.
+
+XXX iterating over the ranges in a slice
+
 ### Getting bytes from and putting bytes into cuerdas ###
 
-`int cuerda_splice(cuerda *dest, size_t begin, size_t end, cuerda
-*src, size_t sbegin, size_t send)` splices the `send-sbegin` bytes
-from `src` in place of the `end-begin` bytes of `dest`, and returns
-true unless there was an allocation failure.  (XXX this should
-probably use some abstract `location` type rather than `size_t`.)
+`int cuerda_copy(cuerda_slice dest, cuerda_slice src)` replaces the
+bytes contained in `dest` with a copy of the contents of `src`, which
+need not be the same length, and returns
+true unless there was an allocation failure.  `dest` and `src` may belong
+to the same cuerda or different cuerdas.  I don’t know what it will do if they
+overlap yet.  Takes O(N+log(M)) time, with N being
+the size of the data copied, and M being the size of the destination cuerda.
 
-If `end == begin`, this is simple insertion; if `send == sbegin`, it
+If `dest` is empty, this is simple insertion; if `src` is empty, it
 is simple deletion.  The combined operation is provided because it can
-be more efficient.  If `begin == 0 && end == cuerda_len(dest)`, this
-is analogous to `strcpy`; if `begin == end && end == cuerda_len(dest)`,
+be more efficient.  If `dest` is `cuerda_all(c)`, this
+is analogous to `strcpy`; if it is an empty slice at the end of a cuerda,
 this is analogous to `strcat`.
-
-This takes time linear in the amount of data inserted into the cuerda.
 
 The following variants provide similar functionality with other
 sources of data:
 
-`int cuerda_splice_file(cuerda *dest, size_t begin, size_t end, int
+`int cuerda_splice_file(cuerda_slice dest, int
 fd, size_t fbegin, size_t fend)`, analogously, lazily splices a byte
 range from the given file descriptor into the cuerda.  Because it’s
 lazy, this takes O(log(N)) time in the previous size of the cuerda.
@@ -120,28 +198,28 @@ indeterminate.
 
 XXX I don’t currently have a good way to report I/O errors.
 
-`int cuerda_splice_bytes_lazily(cuerda *dest, size_t begin, size_t
-end, char *bytes, char *bend)`, analogously, lazily splices a region
+`int cuerda_splice_bytes_lazily(cuerda_slice dest, char *bytes,
+char *bend)`, analogously, lazily splices a region
 of memory into the cuerda.  You should guarantee that the memory will
 not change until you remove this region from the cuerda; if it
 changes, results may be indeterminate.  Also takes O(log(N)) time in
 the previous size of the cuerda.
 
-`int cuerda_splice_bytes(cuerda *dest, size_t begin, size_t end, char
-*bytes, char *bend)`, analogously, eagerly splices a region of memory
+`int cuerda_splice_bytes(cuerda_slice dest, char *bytes,
+char *bend)`, analogously, eagerly splices a region of memory
 into the cuerda, immediately copying it into cuerda nodes.  This takes
 O(log(N) + M) time, where N is the previous size of the cuerda, and M
 is `bend-bytes`.
 
-`void cuerda_get(char *dest, cuerda *, size_t begin, size_t end)`
+`void cuerda_get(char *dest, cuerda_slice src)`
 copies the specified byte range from the cuerda into the space
 starting at `dest`.  This does not NUL-terminate `dest`; it writes
-strictly `end-begin` bytes to `dest`, and cuerdas support NUL bytes
+strictly `cuerda_len(src)` bytes to `dest`, and cuerdas support NUL bytes
 just like any other byte.  NUL-terminate it yourself if you need that.
 This takes O(log(N) + M) time, where N is the total size of the
-cuerda, and M is `end-begin`.
+cuerda, and M is the `cuerda_len(src)`.
 
-`void cuerda_write(int fd, cuerda *, size_t begin, size_t end)` writes
+`void cuerda_write(int fd, cuerda_slice src)` writes
 the specified byte range from the cuerda to the given file descriptor.
 God knows what kind of time this will take.  It may hang with `nfs
 server bozo not responding still trying` until you fix your NFS
@@ -150,39 +228,10 @@ server.
 XXX I don’t currently have a good way to report I/O errors here
 either.  At least this time I have a return value I could use.
 
-`size_t cuerda_len(cuerda *)`, analogously to `strlen`, returns the
-number of bytes stored in the cuerda, initially zero.  Constant time.
-
 ### Marks ###
 
-`cuerda_mark *cuerda_new_mark(cuerda *, size_t offset, int tag, void
-*user_data)` dynamically allocates a new mark pointing to the given
-offset with the given metadata.  This is a convenience wrapper for
-`cuerda_make_mark`.  It returns NULL on allocation failure.  Takes
-O(log(N)) time in the size of the cuerda.
-
-`void cuerda_free_mark(cuerda_mark *)` destroys and deallocates a
-mark.  This is a convenience wrapper for `cuerda_destroy_mark`.
-O(log(N)) time in the size of the cuerda.
-
-The more important performance consideration is that if you leave
-marks sitting around, they take up a surprising amount of memory, and
-also slow down all kinds of mutation operations in their vicinity,
-although not nearly as much as you probably expect if you’re used to
-writing Elisp.  So you should probably free your marks at the earliest
-opportunity.  If you love them, at least.
-
-`int cuerda_move_mark(cuerda_mark *, cuerda *, size_t offset)` changes
-where a mark points.  It returns true unless there was an allocation
-failure, which can totally happen, so watch out.  O(log(N)) time in
-the size of the cuerda.
-
-The `cuerda_mark` structure itself has public fields `cuerda`, `tag`,
-and `user_data`.
-
-`size_t cuerda_mark_get_offset(cuerda_mark *)` returns the offset in
-the cuerda where the mark currently points.  O(log(N)) time in the
-size of the cuerda.
+XXX this section is obsolete but I haven’t fixed the ranges section
+yet
 
 `cuerda_mark *cuerda_first_mark(cuerda *, size_t begin, size_t end)`
 returns a pointer to the first mark within the given region, or `NULL`
@@ -205,12 +254,12 @@ true unless there is an allocation failure.  Constant time.
 specified cuerda, but doesn’t try to deallocate the cuerda itself.
 O(N) time.
 
-`int cuerda_make_mark(cuerda_mark *dest, cuerda *, size_t offset, int
-tag, void *user_data)` sets up a new mark in the uninitialized memory
+`int cuerda_make_range(cuerda_range *dest, cuerda_slice, int
+tag, void *user_data)` sets up a new range in the uninitialized memory
 at `dest`.  It returns true unless there is an allocation failure.
 O(log(N)) in cuerda size.
 
-`void cuerda_destroy_mark(cuerda_mark *)` destroys a mark (detaching
+`void cuerda_destroy_range(cuerda_range *)` destroys a range (detaching
 it from its cuerda) but doesn’t try to deallocate it.  O(log(N)) in
 cuerda size.
 
@@ -252,9 +301,11 @@ have to be extra mutexy with cuerdas that might have lazy splices
 still active; none of this multiple-readers nonsense.  Otherwise,
 multiple readers are fine.
 
-Creating and moving marks in a cuerda counts as modifying it.
+Creating and moving ranges in a cuerda counts as modifying it.
+Creating and manipulating `cuerda_slice` objects for it does not.
 
-Also, keep in mind that you probably need some memory fence
+Also, keep in mind that, if you’re using threads,
+you probably need some memory fence
 instructions to make sure those modifications are completely visible,
 like the ones introduced by pretty much whatever locking mechanism you
 use.  Use whatever you want.  Just don’t expect me to be interested in
@@ -267,7 +318,12 @@ A cuerda is a mutable in-memory B-tree, in which each non-root node
 has a pointer to its parent, and each parent knows the total number of
 bytes of text in each child’s subtree.  There are two types of leaf
 nodes: those that contain literal bytes in memory and those that
-lazily load data from an open file or area of memory.  Each leaf node
+lazily load data from an open file or area of memory.
+
+A range consists of the attached metadata and two marks, internal
+objects that do not escape the cuerda API.
+
+Each leaf node
 has an array of pointers to the marks in that leaf node; each mark has
 a pointer to its leaf node, a byte offset within that leaf node, a
 type tag, and a pointer to some arbitrary application-specific
@@ -276,6 +332,9 @@ metadata associated with that mark and that type tag.
 The root node’s parent pointer points at the cuerda object, because
 when we split the root node, we need a way to point the cuerda object
 at the new root node.
+
+The cuerda object itself contains pointers to the first and last leaf
+nodes in order to make traversal from the beginning constant-time.
 
 Because nodes have parent pointers, they cannot be shared between
 cuerdas.
